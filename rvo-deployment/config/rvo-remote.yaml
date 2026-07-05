@@ -1,0 +1,54 @@
+# Demo config: RVO reads a camera and fans frames out to external gRPC
+# model services. Run via run_poc.sh from the buildwithrvo root.
+camera:
+  device_index: 0
+
+clips_dir: clips/demo
+event_log: events.jsonl
+
+# RVO Engine 1.1.0 Feature: Dynamic Signal Types
+# output_signal allows arbitrary string names, bypassing legacy constraints.
+# Engine dynamically maps them to generic internal slots for lock-free processing.
+
+detectors:
+  - kind: remote_grpc
+    endpoint: "http://localhost:50051"
+    output_signal: PhoneDetected
+    max_fps: 8
+    timeout_ms: 2000
+    ttl_ms: 1000
+
+  - kind: remote_grpc
+    endpoint: "http://localhost:50051"
+    output_signal: FaceAbsent
+    max_fps: 8
+    timeout_ms: 2000
+    ttl_ms: 1000
+
+  - kind: remote_grpc
+    endpoint: "http://localhost:50051"
+    output_signal: MultiFacePresent
+    max_fps: 8
+    timeout_ms: 2000
+    ttl_ms: 1000
+
+# Events fire when their signal holds for duration_ms, then cool down.
+# event_type dynamically resolves as well.
+events:
+  - event_type: PhoneDetectedEvent
+    signal_type: PhoneDetected
+    signal_threshold: 1
+    duration_ms: 1000
+    cooldown_ms: 5000
+
+  - event_type: FaceAbsentEvent
+    signal_type: FaceAbsent
+    signal_threshold: 1
+    duration_ms: 1000
+    cooldown_ms: 5000
+
+  - event_type: MultiFaceEvent
+    signal_type: MultiFacePresent
+    signal_threshold: 1
+    duration_ms: 1000
+    cooldown_ms: 5000

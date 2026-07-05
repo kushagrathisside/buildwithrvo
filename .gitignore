@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+rvo-deployment/clips/
+rvo-deployment/events.jsonl
+rvo-deployment/events_*.jsonl
