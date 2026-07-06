@@ -1,7 +1,7 @@
 # Demo config: RVO reads a camera and fans frames out to external gRPC
 # model services. Run via run_poc.sh from the buildwithrvo root.
 camera:
-  device_index: 0
+  source_uri: "/home/pro2024001/buildwithrvo/poc-dashboard/../samplevideos/phoneandclear_frames/frame_%04d.jpg"
 
 clips_dir: clips/demo
 event_log: events.jsonl
@@ -38,17 +38,17 @@ events:
   - event_type: PhoneDetectedEvent
     signal_type: PhoneDetected
     signal_threshold: 1
-    duration_ms: 1000
+    duration_ms: 0
     cooldown_ms: 5000
 
   - event_type: FaceAbsentEvent
     signal_type: FaceAbsent
     signal_threshold: 1
-    duration_ms: 1000
+    duration_ms: 0
     cooldown_ms: 5000
 
   - event_type: MultiFaceEvent
     signal_type: MultiFacePresent
     signal_threshold: 1
-    duration_ms: 1000
+    duration_ms: 0
     cooldown_ms: 5000

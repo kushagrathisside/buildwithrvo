@@ -27,11 +27,15 @@ def get_yolo_model():
         _model = YOLO(model_path if os.path.exists(model_path) else "yolov8n.pt")
     return _model
 
-def get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None:
-        _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    return _face_cascade
+def detect_person_count(frame_bgr):
+    yolo = get_yolo_model()
+    results = yolo.predict(frame_bgr, conf=0.25, verbose=False)
+    person_count = 0
+    for r in results:
+        for c in r.boxes.cls:
+            if int(c) == 0:  # COCO class 0 is person
+                person_count += 1
+    return person_count
 
 def analyze_clip(clip_path):
     print(f"[Worker] Analyzing clip: {clip_path}", flush=True)
@@ -54,7 +58,6 @@ def analyze_clip(clip_path):
         frames_total = len([f for f in os.listdir(clip_path) if f.startswith("frame_") and f.endswith(".jpg")])
 
     yolo = get_yolo_model()
-    face_cascade = get_face_cascade()
     
     detections_by_frame = {}
     phone_infractions = 0
@@ -80,13 +83,7 @@ def analyze_clip(clip_path):
             frame_detections.append({"class": "phone", "bbox": [int(x) for x in xyxy], "conf": round(conf, 2)})
             phone_infractions += 1
             
-        # Haar Cascades Face Detection
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-        for (x, y, w, h) in faces:
-            frame_detections.append({"class": "face", "bbox": [int(x), int(y), int(x + w), int(y + h)], "conf": 1.0})
-
-        n_faces = len(faces)
+        n_faces = detect_person_count(img)
         if n_faces == 0:
             face_absent_count += 1
         elif n_faces > 1:
@@ -183,7 +180,6 @@ if __name__ == "__main__":
     # Initialize models
     print("[Worker] Loading ML models...", flush=True)
     get_yolo_model()
-    get_face_cascade()
     
     print(f"[Worker] Processing any backlog in {CLIPS_DIR}...", flush=True)
     process_existing_clips()

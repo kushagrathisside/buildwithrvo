@@ -77,11 +77,25 @@ echo "⚡ Starting gRPC AI Service (:50051)... (logging to ai_service.log)"
 AI_PID=$!
 PIDS+=($AI_PID)
 
+# 1.5 Start the AI Clip Worker in the background
+echo "⚙️  Starting ML Clip Worker... (logging to clip_worker.log)"
+./venv/bin/python ai-service/clip_worker.py > clip_worker.log 2>&1 &
+WORKER_PID=$!
+PIDS+=($WORKER_PID)
+
 # 2. Start the FastAPI dashboard backend in the background
 echo "📊 Starting FastAPI Dashboard Server (:8000)... (logging to dashboard_server.log)"
 ./venv/bin/python poc-dashboard/server.py > dashboard_server.log 2>&1 &
 DASH_PID=$!
 PIDS+=($DASH_PID)
+
+# 2.5 Start the Vite React Frontend
+echo "🌐 Starting Vite React Frontend (:5173)... (logging to vite_frontend.log)"
+cd poc-dashboard-v2
+npm run dev -- --host 127.0.0.1 > ../vite_frontend.log 2>&1 &
+VITE_PID=$!
+PIDS+=($VITE_PID)
+cd ..
 
 # 3. Wait for FastAPI to be ready (with timeout — won't hang forever)
 echo "⏳ Waiting for services to initialize..."
@@ -89,7 +103,7 @@ WAIT=0
 until curl -s http://localhost:8000/api/status > /dev/null 2>&1; do
     sleep 0.5
     WAIT=$((WAIT + 1))
-    if [ $WAIT -gt 40 ]; then
+    if [ $WAIT -gt 120 ]; then
         echo "❌ Timeout: FastAPI dashboard failed to start. Check dashboard_server.log"
         exit 1
     fi
@@ -100,14 +114,15 @@ WAIT=0
 until ./venv/bin/python -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',50051)); s.close()" > /dev/null 2>&1; do
     sleep 0.5
     WAIT=$((WAIT + 1))
-    if [ $WAIT -gt 40 ]; then
+    if [ $WAIT -gt 120 ]; then
         echo "❌ Timeout: gRPC AI service failed to start. Check ai_service.log"
         exit 1
     fi
 done
 
 echo "✅ Services online!"
-echo "🖥️  Proctoring Dashboard available at: http://localhost:8000"
+echo "🖥️  Proctoring Dashboard (Backend) available at: http://localhost:8000"
+echo "🌐 Proctoring UI (React) available at: http://localhost:5173"
 echo "⚙️  RVO engine starting. Press CTRL+C to stop all services."
 echo "--------------------------------------------------------"
 

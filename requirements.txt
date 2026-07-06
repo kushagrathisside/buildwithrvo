@@ -2,7 +2,8 @@ grpcio>=1.59.0
 grpcio-tools>=1.59.0
 protobuf>=4.24.4
 ultralytics>=8.0.0
-opencv-python-headless>=4.8.0
+opencv-python-headless==5.0.0.93
+numpy>=2.0.0
 fastapi>=0.104.1
 uvicorn>=0.23.2
 httpx>=0.25.1
