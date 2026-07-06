@@ -1,0 +1,65 @@
+name: RVO Test Suite
+
+on:
+  push:
+    branches: [ "main", "stablev1" ]
+  pull_request:
+    branches: [ "main", "stablev1" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install System Dependencies (OpenCV & GStreamer)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-glx libglib2.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+
+    - name: Install Python Dependencies
+      run: |
+        python -m venv venv
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Frontend Dependencies
+      run: |
+        npm install
+        cd poc-dashboard-v2
+        npm install
+
+    - name: Install Playwright Browsers
+      run: npx playwright install --with-deps chromium
+
+    - name: Run Test Suite (Pytest + Playwright)
+      run: |
+        source venv/bin/activate
+        # Provide execution permissions
+        chmod +x rvo-deployment/rvo-bin
+        chmod +x run_tests.sh
+        
+        # Run tests
+        ./run_tests.sh
+
+    - name: Upload Playwright Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: playwright-report
+        path: playwright-report/
+        retention-days: 14
