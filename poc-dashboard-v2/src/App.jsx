@@ -4,14 +4,15 @@ import './index.css';
 const IncidentFeed = ({ incidents, selectedIncident, onSelect }) => {
   if (incidents.length === 0) {
     return (
-      <div className="incident-feed" id="incidentFeed">
-        <div className="empty-state">No incidents logged yet. Monitoring...</div>
+      <div className="empty-state">
+        <i className="fa-solid fa-eye-slash"></i>
+        <p>No incidents detected yet. Monitoring active feeds...</p>
       </div>
     );
   }
 
   return (
-    <div className="incident-feed" id="incidentFeed">
+    <>
       {incidents.map((incident) => {
         let displayTime = new Date(incident.timestamp_sec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const severityClass = incident.severity ? incident.severity.toLowerCase() : 'low';
@@ -20,7 +21,7 @@ const IncidentFeed = ({ incidents, selectedIncident, onSelect }) => {
         return (
           <div 
             key={incident.id} 
-            className={`incident-card ${isSelected ? 'active' : ''}`}
+            className={`incident-item ${isSelected ? 'active' : ''}`}
             onClick={() => onSelect(incident)}
           >
             <div className="incident-header">
@@ -29,36 +30,13 @@ const IncidentFeed = ({ incidents, selectedIncident, onSelect }) => {
             </div>
             <div className="incident-title">{incident.category || 'Anomaly Detected'}</div>
             <div className="incident-meta">
-              <span><i className="fas fa-clock"></i> {displayTime}</span>
-              <span><i className="fas fa-film"></i> {incident.frames_total} f</span>
+              <span><i className="fa-solid fa-clock"></i> {displayTime}</span>
+              <span><i className="fa-solid fa-film"></i> {incident.frames_total} frames</span>
             </div>
           </div>
         );
       })}
-    </div>
-  );
-};
-
-const MetricsPanel = ({ metrics }) => {
-  return (
-    <div className="metrics-panel">
-      <div className="metric-box">
-        <div className="metric-value">{metrics.ticks || 0}</div>
-        <div className="metric-label">Ticks</div>
-      </div>
-      <div className="metric-box">
-        <div className="metric-value">{metrics.events_emitted || 0}</div>
-        <div className="metric-label">Events</div>
-      </div>
-      <div className="metric-box">
-        <div className="metric-value">{metrics.detector_execs || 0}</div>
-        <div className="metric-label">AI Inference</div>
-      </div>
-      <div className="metric-box">
-        <div className="metric-value">{metrics.frame_drops || 0}</div>
-        <div className="metric-label">Drops</div>
-      </div>
-    </div>
+    </>
   );
 };
 
@@ -108,14 +86,6 @@ const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
     img.src = `http://localhost:8000/api/incidents/${selectedIncident.id}/frames/${frameName}`;
     
     img.onload = () => {
-      // Setup canvas dimensions based on image
-      // Note: in a real app you might want to handle resizeObserver to make the canvas truly responsive
-      // but for this POC we'll set the internal resolution to match the image
-      if (canvas.width !== img.width || canvas.height !== img.height) {
-        canvas.width = img.width;
-        canvas.height = img.height;
-      }
-      
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       
@@ -142,41 +112,133 @@ const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
           
           ctx.fillStyle = ctx.strokeStyle;
           ctx.font = '16px Inter, sans-serif';
-          ctx.fillText(`${det.class} ${det.conf}`, x1, y1 - 5);
+          ctx.fillText(`${det.class} ${Math.round(det.conf * 100)}%`, x1, y1 - 5);
         });
       }
     };
   }, [currentFrameIdx, incidentData, selectedIncident]);
 
-  if (!selectedIncident) {
-    return (
-      <div className="viewer-placeholder">
-        <i className="fas fa-video fa-3x" style={{ opacity: 0.2, marginBottom: '1rem' }}></i>
-        <p>Select an incident from the feed to view playback</p>
-      </div>
-    );
-  }
+  const handleSliderChange = (e) => {
+    const val = parseInt(e.target.value);
+    setCurrentFrameIdx(val);
+    setIsPlaying(false);
+  };
+
+  const totalFrames = incidentData?.meta?.frames_total || 0;
+  const isReady = !!selectedIncident;
 
   return (
-    <div className="player-container">
-      <div className="canvas-wrapper">
-        <canvas ref={canvasRef} className="video-canvas"></canvas>
+    <section className="playback-panel card">
+      <div className="section-header">
+        <h2><i className="fa-solid fa-tv"></i> Precision Evidence Playback</h2>
+        <div id="active-incident-title" className="active-title">{selectedIncident ? selectedIncident.id : 'No Incident Selected'}</div>
       </div>
-      <div className="controls">
-        <button className="control-btn" onClick={() => setIsPlaying(!isPlaying)}>
-          <i className={`fas ${isPlaying ? 'fa-pause' : 'fa-play'}`}></i>
+
+      <div className="video-container">
+        <canvas id="video-canvas" ref={canvasRef} width="640" height="480"></canvas>
+        {!isReady && (
+          <div className="video-overlay" id="video-overlay" style={{ display: 'flex' }}>
+            <div className="overlay-content">
+              <i className="fa-solid fa-play-circle large-play"></i>
+              <p>Select an incident folder from the infractions log to start review</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="playback-controls">
+        <button id="btn-play-pause" className="btn-control" disabled={!isReady} onClick={() => setIsPlaying(!isPlaying)}>
+          <i className={`fa-solid ${isPlaying ? 'fa-pause' : 'fa-play'}`}></i>
         </button>
-        <div className="progress-bar">
-          <div 
-            className="progress-fill" 
-            style={{ width: `${(currentFrameIdx / Math.max(1, (incidentData?.meta?.frames_total || 1) - 1)) * 100}%` }}
-          ></div>
+        <div className="time-slider-container">
+          <input 
+            type="range" 
+            id="time-slider" 
+            min="0" 
+            max={totalFrames > 0 ? totalFrames - 1 : 0} 
+            value={currentFrameIdx} 
+            onChange={handleSliderChange}
+            disabled={!isReady}
+          />
+          <div className="frame-label">
+            <span id="lbl-frame-current">{currentFrameIdx}</span> / <span id="lbl-frame-total">{totalFrames > 0 ? totalFrames - 1 : 0}</span> frames
+          </div>
         </div>
-        <div className="time-display">
-          {currentFrameIdx} / {(incidentData?.meta?.frames_total || 1) - 1} frames
-        </div>
+        <button id="btn-prev" className="btn-control" disabled={!isReady} onClick={() => { setIsPlaying(false); setCurrentFrameIdx(Math.max(0, currentFrameIdx - 1)); }}>
+          <i className="fa-solid fa-step-backward"></i>
+        </button>
+        <button id="btn-next" className="btn-control" disabled={!isReady} onClick={() => { setIsPlaying(false); setCurrentFrameIdx(Math.min(totalFrames > 0 ? totalFrames - 1 : 0, currentFrameIdx + 1)); }}>
+          <i className="fa-solid fa-step-forward"></i>
+        </button>
       </div>
-    </div>
+    </section>
+  );
+};
+
+const DetailsPanel = ({ selectedIncident }) => {
+  const [incidentData, setIncidentData] = useState(null);
+
+  useEffect(() => {
+    if (!selectedIncident) {
+      setIncidentData(null);
+      return;
+    }
+
+    fetch(`http://localhost:8000/api/incidents/${selectedIncident.id}`)
+      .then(res => res.json())
+      .then(setIncidentData)
+      .catch(console.error);
+  }, [selectedIncident]);
+
+  return (
+    <section className="details-panel card">
+      <div className="section-header">
+        <h2><i className="fa-solid fa-magnifying-glass-chart"></i> Diagnostic Insights</h2>
+      </div>
+      
+      <div className="details-content" id="details-content">
+        {!selectedIncident ? (
+          <div className="placeholder-text">
+            <p>Select an incident to view deep classification, severity metrics, and edge encoding latency.</p>
+          </div>
+        ) : !incidentData ? (
+          <div className="placeholder-text"><p>Loading details...</p></div>
+        ) : (
+          <div>
+            <div className="detail-row">
+              <span className="detail-label">Classification</span>
+              <span className="detail-value">{incidentData.violation?.category || 'Unknown'}</span>
+            </div>
+            <div className="detail-row">
+              <span className="detail-label">Confidence</span>
+              <span className="detail-value">{(incidentData.meta?.confidence * 100).toFixed(1)}%</span>
+            </div>
+            <div className="detail-row">
+              <span className="detail-label">Edge Encoding Latency</span>
+              <span className="detail-value">{incidentData.meta?.encode_ms} ms</span>
+            </div>
+            <div className="detail-row">
+              <span className="detail-label">Total Duration</span>
+              <span className="detail-value">{incidentData.meta?.frames_total} frames</span>
+            </div>
+            
+            <h3 style={{ marginTop: '1.5rem', marginBottom: '1rem', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '0.5rem', color: '#60a5fa' }}>Detections Summary</h3>
+            <div className="detail-row">
+              <span className="detail-label">Phones Detected</span>
+              <span className="detail-value">{incidentData.violation?.phone_count || 0}</span>
+            </div>
+            <div className="detail-row">
+              <span className="detail-label">Face Missing Frames</span>
+              <span className="detail-value">{incidentData.violation?.face_absent_count || 0}</span>
+            </div>
+            <div className="detail-row">
+              <span className="detail-label">Multi-Face Frames</span>
+              <span className="detail-value">{incidentData.violation?.face_multi_count || 0}</span>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
   );
 };
 
@@ -223,7 +285,6 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source: src })
       });
-      // Optionally reset UI state here
       setSelectedIncident(null);
       setIncidents([]);
     } catch (err) {
@@ -231,52 +292,105 @@ function App() {
     }
   };
 
-  return (
-    <div className="app-container">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="logo">RVO</div>
-          <h1>Proctor V2</h1>
-        </div>
-        
-        <div className="video-source-selector" style={{ padding: '0 1.5rem', marginBottom: '1rem' }}>
-          <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', textTransform: 'uppercase', letterSpacing: '1px' }}>Camera Source</label>
-          <select 
-            value={videoSource} 
-            onChange={handleSourceChange}
-            style={{ width: '100%', padding: '0.75rem', borderRadius: '8px', background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', color: 'white', outline: 'none' }}
-          >
-            <option value="webcam" style={{ color: 'black' }}>Live Webcam</option>
-            <option value="hideandpeep.mp4" style={{ color: 'black' }}>Sample: Face Absent (hideandpeep.mp4)</option>
-            <option value="phoneandclear.mp4" style={{ color: 'black' }}>Sample: Phone Detected (phoneandclear.mp4)</option>
-          </select>
-        </div>
+  const isOnline = metrics && metrics.ticks !== undefined;
 
-        <div className="feed-header">
-          <h2>Flagged Infractions</h2>
-          <div className="status-indicator">
-            <span className="pulse"></span> Live
+  return (
+    <>
+      <div className="glass-bg"></div>
+      <div className="glow glow-1"></div>
+      <div className="glow glow-2"></div>
+      
+      <header className="app-header">
+        <div className="header-logo">
+          <span className="logo-icon"><i className="fa-solid fa-shield-halved"></i></span>
+          <div className="logo-text">
+            <h1>RVO AI Proctoring Node</h1>
+            <p>Realtime Video Orchestration & Edge YOLOv8/Haar-Cascades</p>
           </div>
         </div>
         
-        <IncidentFeed 
-          incidents={incidents} 
-          selectedIncident={selectedIncident} 
-          onSelect={setSelectedIncident} 
-        />
-      </aside>
-      
-      <main className="main-content">
-        <MetricsPanel metrics={metrics} />
-        <div className="viewer-panel">
-          <PlaybackViewer 
-            selectedIncident={selectedIncident} 
-            isPlaying={isPlaying} 
-            setIsPlaying={setIsPlaying} 
-          />
+        <div className="health-badges">
+          <div id="badge-rvo" className={`health-badge ${isOnline ? 'online' : 'offline'}`}>
+            <span className="indicator"></span>
+            <span className="badge-label"><i className="fa-solid fa-server"></i> RVO Engine: <b id="rvo-status-text">{isOnline ? 'ONLINE' : 'OFFLINE'}</b></span>
+          </div>
+          <div id="badge-ai" className={`health-badge ${isOnline ? 'online' : 'offline'}`}>
+            <span className="indicator"></span>
+            <span className="badge-label"><i className="fa-solid fa-brain"></i> AI gRPC Service: <b id="ai-status-text">{isOnline ? 'ONLINE' : 'OFFLINE'}</b></span>
+          </div>
         </div>
+      </header>
+
+      <main className="dashboard-grid">
+        <section className="metrics-bar card">
+          <div className="section-header">
+            <h2><i className="fa-solid fa-chart-line"></i> RVO Engine Live Statistics</h2>
+            <div className="header-controls">
+              <div className="source-selector">
+                <label htmlFor="camera-source"><i className="fa-solid fa-video"></i> Input Source:</label>
+                <select id="camera-source" className="styled-select" value={videoSource} onChange={handleSourceChange}>
+                  <option value="webcam">Live Webcam</option>
+                  <option value="hideandpeep.mp4">Sample: Hide & Peep</option>
+                  <option value="phoneandclear.mp4">Sample: Phone & Clear</option>
+                </select>
+              </div>
+              <div className="live-pulse">REAL-TIME</div>
+            </div>
+          </div>
+          <div className="metrics-grid">
+            <div className="metric-item">
+              <span className="metric-value" id="metric-ticks">{metrics.ticks || '-'}</span>
+              <span className="metric-title"><i className="fa-solid fa-clock"></i> Scheduler Ticks</span>
+            </div>
+            <div className="metric-item">
+              <span className="metric-value" id="metric-events">{metrics.events_emitted || '-'}</span>
+              <span className="metric-title"><i className="fa-solid fa-circle-exclamation text-red"></i> Events Emitted</span>
+            </div>
+            <div className="metric-item">
+              <span className="metric-value" id="metric-frame-drops">{metrics.frame_drops || '-'}</span>
+              <span className="metric-title"><i className="fa-solid fa-triangle-exclamation text-orange"></i> Frame Drops</span>
+            </div>
+            <div className="metric-item">
+              <span className="metric-value" id="metric-clip-drops">{metrics.clip_drops || '-'}</span>
+              <span className="metric-title"><i className="fa-solid fa-folder-minus text-orange"></i> Clip Drops</span>
+            </div>
+            <div className="metric-item">
+              <span className="metric-value" id="metric-skips">{metrics.detector_execs || '-'}</span>
+              <span className="metric-title"><i className="fa-solid fa-forward-step"></i> Detector Skips</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="incidents-panel card">
+          <div className="section-header">
+            <h2><i className="fa-solid fa-list-check"></i> Flagged Infractions Feed</h2>
+            <button id="btn-refresh" className="btn-icon" title="Refresh List"><i className="fa-solid fa-rotate"></i></button>
+          </div>
+          
+          <div className="incidents-list-container">
+            <div id="incidents-list" className="incidents-list">
+              <IncidentFeed 
+                incidents={incidents} 
+                selectedIncident={selectedIncident} 
+                onSelect={setSelectedIncident} 
+              />
+            </div>
+          </div>
+        </section>
+
+        <PlaybackViewer 
+          selectedIncident={selectedIncident} 
+          isPlaying={isPlaying} 
+          setIsPlaying={setIsPlaying} 
+        />
+
+        <DetailsPanel selectedIncident={selectedIncident} />
       </main>
-    </div>
+
+      <footer className="app-footer">
+        <p>Built with <i className="fa-solid fa-heart text-red"></i> for the <b>Realtime Video Orchestration (RVO)</b> Engine Ecosystem</p>
+      </footer>
+    </>
   );
 }
 
