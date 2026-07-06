@@ -1,17 +1,18 @@
 import os
 import json
 import httpx
-import cv2
-import numpy as np
-import time
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+import asyncio
+import re
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
-from ultralytics import YOLO
+from starlette.concurrency import run_in_threadpool
+from sse_starlette.sse import EventSourceResponse
 import socket
 
+import database
+database.init_db()
 app = FastAPI(title="RVO Proctoring Dashboard Backend")
 
 # Enable CORS for local testing
@@ -25,35 +26,14 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Schema version for violation_meta.json — bump when classification logic changes
-# Any cached file without this version will be re-analyzed automatically
-SCHEMA_VERSION = 2
-
-# All live incident clips are written to clips/demo by rvo-remote.yaml
-# We also scan the parent clips/ for pre-existing historical clips
-CLIPS_DIRS = [
-    os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment/clips/demo")),
-    os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment/clips")),
-]
-
-# Lazy load the models to keep startup fast
-_model = None
-_face_cascade = None
-
-def get_yolo_model():
-    global _model
-    if _model is None:
-        model_path = os.path.abspath(os.path.join(BASE_DIR, "../ai-service/yolov8n.pt"))
-        if os.path.exists(model_path):
-            _model = YOLO(model_path)
-        else:
-            _model = YOLO("yolov8n.pt")
-    return _model
+# ── Allowed sample video names (Bug #15: input validation) ─────────────────
+ALLOWED_SOURCES = {"webcam", "hideandpeep.mp4", "phoneandclear.mp4"}
 
 def extract_frames(video_name):
     """
     Extracts an MP4 into a sequence of JPEGs so the Rust OpenCV engine
     can read it even if the host OS lacks video codecs (CAP_FFMPEG).
+    Bug #6 fix: Start frame numbering at 0 to match frontend indexing.
     """
     video_path = os.path.join(BASE_DIR, "../samplevideos", video_name)
     frames_dir = os.path.join(BASE_DIR, "../samplevideos", video_name.replace('.mp4', '_frames'))
@@ -62,8 +42,9 @@ def extract_frames(video_name):
         return frames_dir
         
     os.makedirs(frames_dir, exist_ok=True)
+    import cv2
     cap = cv2.VideoCapture(video_path)
-    count = 1
+    count = 0  # Bug #6: Start at 0, not 1
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -72,149 +53,6 @@ def extract_frames(video_name):
         count += 1
     cap.release()
     return frames_dir
-
-def get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None:
-        _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    return _face_cascade
-
-def analyze_and_cache_clip(clip_path):
-    """
-    Scans a clip directory and performs YOLOv8/Cascade detections for all frames.
-    Saves the results in violation_meta.json to cache them.
-    If the cached file has an older schema_version it is invalidated and re-run.
-    """
-    meta_path = os.path.join(clip_path, "meta.json")
-    vmeta_path = os.path.join(clip_path, "violation_meta.json")
-
-    # Load cache — but only if schema version matches current version
-    if os.path.exists(vmeta_path):
-        try:
-            with open(vmeta_path, "r") as f:
-                cached = json.load(f)
-            if cached.get("schema_version") == SCHEMA_VERSION:
-                return cached
-            # Schema mismatch — fall through to re-analyze
-        except Exception:
-            pass
-
-    frames_total = 0
-    # Read meta.json for frame count AND original event_type (primary classifier)
-    event_type_from_meta = None
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-                frames_total = meta.get("frames_total", 0)
-                event_type_from_meta = meta.get("event_type")
-        except Exception:
-            pass
-
-    if not frames_total:
-        frames_total = len([f for f in os.listdir(clip_path) if f.startswith("frame_") and f.endswith(".jpg")])
-
-    yolo = get_yolo_model()
-    face_cascade = get_face_cascade()
-    
-    detections_by_frame = {}
-    phone_infractions = 0
-    face_infractions = 0
-    
-    face_absent_count = 0     # frames where face_count == 0
-    face_multi_count = 0      # frames where face_count > 1
-    
-    for i in range(frames_total):
-        frame_file = os.path.join(clip_path, f"frame_{i:04d}.jpg")
-        if not os.path.exists(frame_file):
-            continue
-            
-        img = cv2.imread(frame_file)
-        if img is None:
-            continue
-            
-        frame_detections = []
-        
-        # 1. Phone Detection (YOLO)
-        results = yolo(img, classes=[67], verbose=False)
-        for box in results[0].boxes:
-            xyxy = box.xyxy[0].tolist()
-            conf = float(box.conf[0])
-            frame_detections.append({
-                "class": "phone",
-                "bbox": [int(x) for x in xyxy],
-                "conf": round(conf, 2)
-            })
-            phone_infractions += 1
-            
-        # 2. Face Detection (Haar Cascades)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-        
-        for (x, y, w, h) in faces:
-            frame_detections.append({
-                "class": "face",
-                "bbox": [int(x), int(y), int(x + w), int(y + h)],
-                "conf": 1.0
-            })
-
-        n_faces = len(faces)
-        if n_faces == 0:
-            face_absent_count += 1
-        elif n_faces > 1:
-            face_multi_count += 1
-
-        if frame_detections:
-            detections_by_frame[str(i)] = frame_detections
-
-    # Compute total face infraction frames after the loop (not inside it)
-    face_infractions = face_absent_count + face_multi_count
-
-    # --- Primary classification: use event_type from meta.json (most reliable) ---
-    # Then folder name prefix, then fall back to re-inference counts
-    EVENT_TYPE_MAP = {
-        "PhoneDetectedEvent": ("Mobile Phone Violation", "HIGH"),
-        "FaceAbsentEvent":    ("Face Absent — Student Left Frame", "HIGH"),
-        "MultiFaceEvent":     ("Multiple Faces — Proxy / Impersonation", "HIGH"),
-    }
-
-    folder_name = os.path.basename(clip_path)
-
-    if event_type_from_meta and event_type_from_meta in EVENT_TYPE_MAP:
-        category, severity = EVENT_TYPE_MAP[event_type_from_meta]
-    elif any(folder_name.startswith(k) for k in EVENT_TYPE_MAP):
-        matched = next(k for k in EVENT_TYPE_MAP if folder_name.startswith(k))
-        category, severity = EVENT_TYPE_MAP[matched]
-    elif phone_infractions > 0 and phone_infractions >= face_infractions:
-        category, severity = "Mobile Phone Violation", "HIGH"
-    elif face_absent_count > face_multi_count:
-        category, severity = "Face Absent — Student Left Frame", "HIGH"
-    elif face_multi_count > 0:
-        category, severity = "Multiple Faces — Proxy / Impersonation", "HIGH"
-    elif face_infractions > 0:
-        category, severity = "Face Anomaly (Absent / Multi-Face)", "MEDIUM"
-    else:
-        category, severity = "Unclassified Violation", "LOW"
-        
-    vmeta = {
-        "schema_version": SCHEMA_VERSION,
-        "category": category,
-        "severity": severity,
-        "detections": detections_by_frame,
-        "phone_count": phone_infractions,
-        "face_anomaly_count": face_infractions,
-        "face_absent_count": face_absent_count,
-        "face_multi_count": face_multi_count
-    }
-    
-    try:
-        with open(vmeta_path, "w") as f:
-            json.dump(vmeta, f, indent=2)
-    except Exception as e:
-        print(f"Failed to write cache: {e}")
-        
-    return vmeta
-
 
 
 @app.get("/api/status")
@@ -253,6 +91,10 @@ async def set_source(payload: dict):
     source = payload.get("source")
     if not source:
         raise HTTPException(status_code=400, detail="Missing 'source' parameter")
+    
+    # Bug #15: Validate source against allowlist
+    if source not in ALLOWED_SOURCES:
+        raise HTTPException(status_code=400, detail=f"Invalid source: {source}")
         
     config_path = os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment/config/rvo-remote.yaml"))
     
@@ -260,36 +102,41 @@ async def set_source(payload: dict):
         with open(config_path, "r") as f:
             content = f.read()
             
-        import re
         if source == "webcam":
             new_cam = "camera:\n  device_index: 0"
         else:
-            # We assume source is either "hideandpeep.mp4" or "phoneandclear.mp4"
-            # Extract frames via Python cv2 (which has bundled FFMPEG) to bypass Rust OS codec issues
-            frames_dir = extract_frames(source)
+            # Bug #7: Run extract_frames in threadpool to avoid blocking async event loop
+            frames_dir = await run_in_threadpool(extract_frames, source)
             new_cam = f"camera:\n  source_uri: \"{frames_dir}/frame_%04d.jpg\""
             
         content = re.sub(r'camera:[\s\n]+(?:device_index:[^\n]+|source_uri:[^\n]+)', new_cam, content)
         
         with open(config_path, "w") as f:
             f.write(content)
-            
+        
+        # Bug #9: Clear the incidents DB when switching sources
+        database.clear_all_incidents()
+        
         import subprocess
         # 1. Kill existing rvo-bin
         subprocess.run(["pkill", "-9", "-f", "rvo-bin"])
         
-        # 2. Wait a tiny bit for port 9090 to free up
-        time.sleep(0.5)
+        # Bug #8: Use asyncio.sleep instead of blocking time.sleep
+        await asyncio.sleep(0.5)
         
         # 3. Spawn a new rvo-bin in the background
         rvo_cwd = os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment"))
-        subprocess.Popen(
+        # Bug #14: Properly manage the log file handle
+        log_file = open(os.path.join(rvo_cwd, "rvo_bin.log"), "w")
+        proc = subprocess.Popen(
             ["./rvo-bin", "--config", "config/rvo-remote.yaml"],
             cwd=rvo_cwd,
             start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stdout=log_file,
+            stderr=log_file
         )
+        # Close our copy of the file descriptor — the child process has its own
+        log_file.close()
         
         return {"status": "success", "message": f"RVO engine restarted with source: {source}"}
     except Exception as e:
@@ -297,76 +144,50 @@ async def set_source(payload: dict):
 
 @app.get("/api/incidents")
 async def list_incidents():
-    incidents = []
-    
-    # Scan both directories
-    for clips_dir in CLIPS_DIRS:
-        if not os.path.exists(clips_dir):
-            continue
-            
-        subdirs = [d for d in os.listdir(clips_dir) if os.path.isdir(os.path.join(clips_dir, d))]
-        for d in subdirs:
-            if d == "demo":
-                continue
+    return database.get_all_incidents()
+
+@app.get("/api/incidents/stream")
+async def stream_incidents(request: Request):
+    """
+    Server-Sent Events endpoint to stream incidents and metrics to the frontend
+    without polling.
+    """
+    async def event_generator():
+        last_id = None
+        while True:
+            if await request.is_disconnected():
+                break
                 
-            path = os.path.join(clips_dir, d)
-            meta_path = os.path.join(path, "meta.json")
+            # Fetch latest incidents from DB
+            incidents = database.get_all_incidents()
+            new_first_id = incidents[0]["id"] if incidents else None
+            if new_first_id != last_id:
+                last_id = new_first_id
+                yield {
+                    "event": "incidents_update",
+                    "data": json.dumps(incidents)
+                }
+                
+            # Fetch metrics (async fetch from Prometheus)
+            try:
+                metrics = await get_metrics()
+                yield {
+                    "event": "metrics_update",
+                    "data": json.dumps(metrics)
+                }
+            except Exception:
+                pass
+                
+            await asyncio.sleep(1)
             
-            meta = {}
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path, "r") as f:
-                        meta = json.load(f)
-                except Exception:
-                    pass
-                    
-            # Run analysis in thread pool to avoid blocking the async event loop
-            vmeta = await run_in_threadpool(analyze_and_cache_clip, path)
-            
-            incidents.append({
-                "id": d,
-                "timestamp_ns": meta.get("event_ts_ns", 0),
-                "timestamp_sec": os.path.getmtime(path),
-                "frames_total": meta.get("frames_total", 0),
-                "encode_ms": meta.get("encode_ms", 0),
-                "category": vmeta.get("category"),
-                "severity": vmeta.get("severity")
-            })
-            
-    # Sort incidents by ID descending (newer first)
-    incidents.sort(key=lambda x: x["id"], reverse=True)
-    return incidents
+    return EventSourceResponse(event_generator())
 
 @app.get("/api/incidents/{incident_id}")
 async def get_incident(incident_id: str):
-    path = None
-    for clips_dir in CLIPS_DIRS:
-        test_path = os.path.join(clips_dir, incident_id)
-        if os.path.exists(test_path) and os.path.isdir(test_path):
-            path = test_path
-            break
-            
-    if not path:
+    inc = database.get_incident_by_id(incident_id)
+    if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
-        
-    meta_path = os.path.join(path, "meta.json")
-    
-    meta = {}
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-        except Exception:
-            pass
-            
-    # Run analysis in thread pool to avoid blocking the async event loop
-    vmeta = await run_in_threadpool(analyze_and_cache_clip, path)
-    
-    return {
-        "meta": meta,
-        "violation": vmeta,
-        "timestamp_sec": os.path.getmtime(path)
-    }
+    return inc
 
 @app.get("/api/incidents/{incident_id}/frames/{frame_name}")
 async def get_frame(incident_id: str, frame_name: str):
@@ -377,6 +198,11 @@ async def get_frame(incident_id: str, frame_name: str):
         raise HTTPException(status_code=400, detail="Invalid frame name")
     if not frame_name.startswith("frame_") or not frame_name.endswith(".jpg"):
         raise HTTPException(status_code=400, detail="Invalid frame name format")
+    
+    CLIPS_DIRS = [
+        os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment/clips/demo")),
+        os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment/clips")),
+    ]
     path = None
     for clips_dir in CLIPS_DIRS:
         test_path = os.path.join(clips_dir, incident_id, frame_name)

@@ -15,8 +15,20 @@ from ultralytics import YOLO
 # Load an ultra-fast edge model
 model = YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt'))
 
-# Load Haar Cascade face detector globally to optimize performance
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# Load YOLOv8 model for both phone and person detection
+yolo_model = YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt'))
+
+def detect_person_count(frame_bgr):
+    """
+    Detects if a person is in the frame using YOLO (proxy for face)
+    """
+    results = yolo_model.predict(frame_bgr, conf=0.25, verbose=False)
+    person_count = 0
+    for r in results:
+        for c in r.boxes.cls:
+            if int(c) == 0:  # COCO class 0 is person
+                person_count += 1
+    return person_count
 
 # Per-frame inference result cache — avoids re-running YOLO+Haar when multiple
 # detectors send the same frame_id within a short window (3 detectors × same frame).
@@ -62,10 +74,8 @@ class ProctorDetector(detector_pb2_grpc.DetectorServicer):
             results = model(img, classes=[67], verbose=False)
             phone_detected = len(results[0].boxes) > 0
             
-            # Face counting with Haar Cascades
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-            face_count = len(faces)
+            # Face counting with YOLOv8 person detection
+            face_count = detect_person_count(img)
 
             # Map to RVO signal types:
             # - PhoneDetected: 1 if a phone is visible in the frame
