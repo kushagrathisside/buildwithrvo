@@ -1,12 +1,13 @@
 import os
 import json
 import httpx
-import time
 import asyncio
+import re
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from sse_starlette.sse import EventSourceResponse
 import socket
 
@@ -25,7 +26,15 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# ── Allowed sample video names (Bug #15: input validation) ─────────────────
+ALLOWED_SOURCES = {"webcam", "hideandpeep.mp4", "phoneandclear.mp4"}
+
 def extract_frames(video_name):
+    """
+    Extracts an MP4 into a sequence of JPEGs so the Rust OpenCV engine
+    can read it even if the host OS lacks video codecs (CAP_FFMPEG).
+    Bug #6 fix: Start frame numbering at 0 to match frontend indexing.
+    """
     video_path = os.path.join(BASE_DIR, "../samplevideos", video_name)
     frames_dir = os.path.join(BASE_DIR, "../samplevideos", video_name.replace('.mp4', '_frames'))
     
@@ -35,7 +44,7 @@ def extract_frames(video_name):
     os.makedirs(frames_dir, exist_ok=True)
     import cv2
     cap = cv2.VideoCapture(video_path)
-    count = 1
+    count = 0  # Bug #6: Start at 0, not 1
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -44,7 +53,6 @@ def extract_frames(video_name):
         count += 1
     cap.release()
     return frames_dir
-
 
 
 @app.get("/api/status")
@@ -83,6 +91,10 @@ async def set_source(payload: dict):
     source = payload.get("source")
     if not source:
         raise HTTPException(status_code=400, detail="Missing 'source' parameter")
+    
+    # Bug #15: Validate source against allowlist
+    if source not in ALLOWED_SOURCES:
+        raise HTTPException(status_code=400, detail=f"Invalid source: {source}")
         
     config_path = os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment/config/rvo-remote.yaml"))
     
@@ -90,35 +102,41 @@ async def set_source(payload: dict):
         with open(config_path, "r") as f:
             content = f.read()
             
-        import re
         if source == "webcam":
             new_cam = "camera:\n  device_index: 0"
         else:
-            frames_dir = extract_frames(source)
+            # Bug #7: Run extract_frames in threadpool to avoid blocking async event loop
+            frames_dir = await run_in_threadpool(extract_frames, source)
             new_cam = f"camera:\n  source_uri: \"{frames_dir}/frame_%04d.jpg\""
             
         content = re.sub(r'camera:[\s\n]+(?:device_index:[^\n]+|source_uri:[^\n]+)', new_cam, content)
         
         with open(config_path, "w") as f:
             f.write(content)
-            
+        
+        # Bug #9: Clear the incidents DB when switching sources
+        database.clear_all_incidents()
+        
         import subprocess
         # 1. Kill existing rvo-bin
         subprocess.run(["pkill", "-9", "-f", "rvo-bin"])
         
-        # 2. Wait a tiny bit for port 9090 to free up
-        time.sleep(0.5)
+        # Bug #8: Use asyncio.sleep instead of blocking time.sleep
+        await asyncio.sleep(0.5)
         
         # 3. Spawn a new rvo-bin in the background
         rvo_cwd = os.path.abspath(os.path.join(BASE_DIR, "../rvo-deployment"))
-        log_file = open("rvo_bin.log", "w")
-        subprocess.Popen(
+        # Bug #14: Properly manage the log file handle
+        log_file = open(os.path.join(rvo_cwd, "rvo_bin.log"), "w")
+        proc = subprocess.Popen(
             ["./rvo-bin", "--config", "config/rvo-remote.yaml"],
             cwd=rvo_cwd,
             start_new_session=True,
             stdout=log_file,
             stderr=log_file
         )
+        # Close our copy of the file descriptor — the child process has its own
+        log_file.close()
         
         return {"status": "success", "message": f"RVO engine restarted with source: {source}"}
     except Exception as e:
@@ -142,8 +160,9 @@ async def stream_incidents(request: Request):
                 
             # Fetch latest incidents from DB
             incidents = database.get_all_incidents()
-            if incidents and incidents[0]["id"] != last_id:
-                last_id = incidents[0]["id"]
+            new_first_id = incidents[0]["id"] if incidents else None
+            if new_first_id != last_id:
+                last_id = new_first_id
                 yield {
                     "event": "incidents_update",
                     "data": json.dumps(incidents)

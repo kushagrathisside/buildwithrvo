@@ -6,3 +6,20 @@ __pycache__/
 rvo-deployment/clips/
 rvo-deployment/events.jsonl
 rvo-deployment/events_*.jsonl
+
+# Generated test video frames
+samplevideos/*_frames/
+
+# Node modules and build output
+node_modules/
+dist/
+build/
+.npm/
+
+# Database
+dashboard.db
+
+# Test artifacts
+.pytest_cache/
+playwright-report/
+test-results/

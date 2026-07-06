@@ -1,6 +1,6 @@
-# POC Architecture & Signal Flow
+# POC Architecture & Signal Flow (V2)
 
-This document details the end-to-end data flow and signal mapping logic implemented in the proctoring POC.
+This document details the end-to-end data flow and signal mapping logic implemented in the proctoring POC V2.
 
 ---
 
@@ -8,15 +8,8 @@ This document details the end-to-end data flow and signal mapping logic implemen
 
 ```text
 +---------------------------------------------------------------------------------------+
-|                                  Dashboard Backend                                    |
-|  Serves an MJPEG HTTP stream at :8000/api/video_feed from a sample MP4 video.         |
-+---------------------------------------------------------------------------------------+
-                                           |
-                                           | (HTTP / OpenCV VideoCapture)
-                                           v
-+---------------------------------------------------------------------------------------+
-|                                   RVO Core Engine                                     |
-|  - Ingests frames and pushes to a circular buffer (capacity 300 / ~10 seconds).       |
+|                                    RVO Core Engine                                    |
+|  - Ingests frames from webcam or MP4 samples into a circular buffer.                  |
 |  - Sequential 1 ms scheduler tick checks FPS limits and signal dependencies.          |
 +---------------------------------------------------------------------------------------+
                                            |
@@ -32,17 +25,34 @@ This document details the end-to-end data flow and signal mapping logic implemen
                                            v
 +---------------------------------------------------------------------------------------+
 |                               RVO Event & Clip Manager                                |
-|  - Signal Store updates with 1-second TTL.                                            |
 |  - Event Engine checks rules: sustained signal for 1000 ms triggers an infraction.    |
 |  - Clip Manager locks buffer, slices the window, writes frames + meta.json to disk.   |
 +---------------------------------------------------------------------------------------+
                                            |
-                                           | (File system write)
+                                           | (Filesystem drop into clips/demo/)
                                            v
 +---------------------------------------------------------------------------------------+
-|                                Streamlit / Web Client                                 |
-|  - Lists incidents; classifies and caches bounding boxes on first load.               |
-|  - HTML5 Canvas displays frames with color-coded warning bounding box overlays.      |
+|                           Async Clip Worker (clip_worker.py)                          |
+|  - Watchdog daemon detects new clips instantly.                                       |
+|  - Runs comprehensive YOLOv8 AI verification across all frames in the clip.           |
+|  - Inserts finalized JSON metadata and telemetry into SQLite Database.                |
++---------------------------------------------------------------------------------------+
+                                           |
+                                           | (SQLite INSERT)
+                                           v
++---------------------------------------------------------------------------------------+
+|                            FastAPI Backend Server (:8000)                             |
+|  - Streams new SQLite incidents down to the frontend via Server-Sent Events (SSE).    |
+|  - Proxies Prometheus telemetry metrics from RVO Engine to the frontend.              |
++---------------------------------------------------------------------------------------+
+                                           |
+                                           | (HTTP / SSE / REST APIs)
+                                           v
++---------------------------------------------------------------------------------------+
+|                                React Frontend (:5173)                                 |
+|  - Receives SSE updates and renders Glassmorphic UI components instantly.             |
+|  - HTML5 Canvas displays frames with color-coded warning bounding box overlays,       |
+|    properly scaled to match aspect ratios.                                            |
 +---------------------------------------------------------------------------------------+
 ```
 
@@ -60,7 +70,7 @@ RVO exposes a fixed enum of signal slots (`Dummy`, `MotionLevel`, `FacePresent`,
 | **Normal Student Presence**| Haar Cascades face count $= 1$ | `FacePresent` | `0` (normal) | - |
 
 ### Trigger Rule
-In [rvo-remote.yaml](file:///home/pro2024001/buildwithrvo/rvo-deployment/config/rvo-remote.yaml), both signals are configured to trigger a `DummyEvent` once the infraction value remains $\ge 1$ continuously for **1,000 milliseconds**. 
+In [rvo-remote.yaml](../rvo-deployment/config/rvo-remote.yaml), both signals are configured to trigger a `DummyEvent` once the infraction value remains $\ge 1$ continuously for **1,000 milliseconds**. 
 
 ---
 
@@ -72,3 +82,4 @@ To prevent this:
 1. The scheduler tick's `execute()` writes the latest camera frame to a **single-slot mailbox** and returns the latest cached gRPC results instantly.
 2. An independent worker thread retrieves the frame from the mailbox, encodes it, calls the gRPC `Detect()` method, and updates the cache.
 3. If gRPC fails or times out, the cache expires via TTL, and the rest of the RVO scheduler continues to tick at 1 ms without head-of-line (HOL) blocking.
+4. Heavy analysis is further offloaded to the asynchronous `clip_worker.py` daemon, removing blocking operations from the HTTP API server.

@@ -1,6 +1,45 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Component } from 'react';
 import './index.css';
 
+// ── Error Boundary (Bug #11) ──────────────────────────────────────────────
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('React Error Boundary caught:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: '2rem', textAlign: 'center', color: '#ff3860' }}>
+          <i className="fa-solid fa-triangle-exclamation" style={{ fontSize: '3rem', marginBottom: '1rem', display: 'block' }}></i>
+          <h2>Something went wrong</h2>
+          <p style={{ color: '#94a3b8', marginTop: '0.5rem' }}>{this.state.error?.message}</p>
+          <button 
+            onClick={() => this.setState({ hasError: false, error: null })}
+            style={{ marginTop: '1rem', padding: '0.5rem 1.5rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.05)', color: 'white', cursor: 'pointer' }}
+          >
+            Retry
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ── Incident Feed ─────────────────────────────────────────────────────────
+// Bug #1: incident-item → incident-card
+// Bug #2: incident-header → incident-card-header
+// Bug #3: severity lowercase → keep UPPERCASE for CSS matching
 const IncidentFeed = ({ incidents, selectedIncident, onSelect }) => {
   if (incidents.length === 0) {
     return (
@@ -14,19 +53,23 @@ const IncidentFeed = ({ incidents, selectedIncident, onSelect }) => {
   return (
     <>
       {incidents.map((incident) => {
-        let displayTime = new Date(incident.timestamp_sec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        const severityClass = incident.severity ? incident.severity.toLowerCase() : 'low';
+        const ts = incident.timestamp_sec;
+        const displayTime = ts
+          ? new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          : '--:--:--';
+        // Bug #3: Keep severity UPPERCASE so CSS `.severity-badge.HIGH` matches
+        const severityClass = incident.severity || 'LOW';
         const isSelected = selectedIncident && selectedIncident.id === incident.id;
 
         return (
           <div 
             key={incident.id} 
-            className={`incident-item ${isSelected ? 'active' : ''}`}
+            className={`incident-card ${isSelected ? 'active' : ''}`}
             onClick={() => onSelect(incident)}
           >
-            <div className="incident-header">
+            <div className="incident-card-header">
               <span className="incident-id">{incident.id}</span>
-              <span className={`severity-badge ${severityClass}`}>{incident.severity || 'LOW'}</span>
+              <span className={`severity-badge ${severityClass}`}>{severityClass}</span>
             </div>
             <div className="incident-title">{incident.category || 'Anomaly Detected'}</div>
             <div className="incident-meta">
@@ -40,34 +83,27 @@ const IncidentFeed = ({ incidents, selectedIncident, onSelect }) => {
   );
 };
 
-const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
+// ── Playback Viewer ───────────────────────────────────────────────────────
+// Bug #12: Share incidentData via prop instead of duplicate fetch
+const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying, incidentData }) => {
   const [currentFrameIdx, setCurrentFrameIdx] = useState(0);
-  const [incidentData, setIncidentData] = useState(null);
   const canvasRef = useRef(null);
   const playIntervalRef = useRef(null);
 
+  // Reset frame index when incident changes
   useEffect(() => {
-    if (!selectedIncident) {
-      setIncidentData(null);
-      setCurrentFrameIdx(0);
-      return;
+    setCurrentFrameIdx(0);
+    if (incidentData) {
+      setIsPlaying(true);
     }
+  }, [selectedIncident, incidentData, setIsPlaying]);
 
-    // Fetch full incident details (for violation meta)
-    fetch(`http://localhost:8000/api/incidents/${selectedIncident.id}`)
-      .then(res => res.json())
-      .then(data => {
-        setIncidentData(data);
-        setCurrentFrameIdx(0);
-        setIsPlaying(true);
-      })
-      .catch(console.error);
-  }, [selectedIncident, setIsPlaying]);
-
+  // Play/pause interval
   useEffect(() => {
-    if (isPlaying && incidentData && incidentData.meta.frames_total > 0) {
+    const framesTotal = incidentData?.meta?.frames_total || 0;
+    if (isPlaying && framesTotal > 0) {
       playIntervalRef.current = setInterval(() => {
-        setCurrentFrameIdx(prev => (prev + 1) % incidentData.meta.frames_total);
+        setCurrentFrameIdx(prev => (prev + 1) % framesTotal);
       }, 100);
     } else {
       clearInterval(playIntervalRef.current);
@@ -76,8 +112,9 @@ const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
     return () => clearInterval(playIntervalRef.current);
   }, [isPlaying, incidentData]);
 
+  // Canvas rendering + bounding boxes
   useEffect(() => {
-    if (!incidentData || !canvasRef.current) return;
+    if (!incidentData || !canvasRef.current || !selectedIncident) return;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     
@@ -89,20 +126,27 @@ const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       
-      // Draw detections
-      if (incidentData.violation && incidentData.violation.detections && incidentData.violation.detections[currentFrameIdx.toString()]) {
-        const dets = incidentData.violation.detections[currentFrameIdx.toString()];
+      const scaleX = canvas.width / img.width;
+      const scaleY = canvas.height / img.height;
+
+      // Draw bounding box detections
+      const dets = incidentData.violation?.detections?.[currentFrameIdx.toString()];
+      if (dets && Array.isArray(dets)) {
         dets.forEach(det => {
-          const [x1, y1, x2, y2] = det.bbox;
+          if (!det.bbox || det.bbox.length < 4) return;
+          const x1 = det.bbox[0] * scaleX;
+          const y1 = det.bbox[1] * scaleY;
+          const x2 = det.bbox[2] * scaleX;
+          const y2 = det.bbox[3] * scaleY;
           
           if (det.class === 'phone') {
-            ctx.strokeStyle = '#ef4444'; // red
+            ctx.strokeStyle = '#ef4444';
             ctx.fillStyle = 'rgba(239, 68, 68, 0.2)';
           } else if (det.class === 'face') {
-            ctx.strokeStyle = '#3b82f6'; // blue
+            ctx.strokeStyle = '#3b82f6';
             ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
           } else {
-            ctx.strokeStyle = '#10b981'; // green
+            ctx.strokeStyle = '#10b981';
             ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
           }
           
@@ -112,9 +156,14 @@ const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
           
           ctx.fillStyle = ctx.strokeStyle;
           ctx.font = '16px Inter, sans-serif';
-          ctx.fillText(`${det.class} ${Math.round(det.conf * 100)}%`, x1, y1 - 5);
+          ctx.fillText(`${det.class} ${Math.round((det.conf || 0) * 100)}%`, x1, y1 - 5);
         });
       }
+    };
+
+    // Bug #9 partial: graceful handling if frame image fails
+    img.onerror = () => {
+      // just leave canvas as-is, don't crash
     };
   }, [currentFrameIdx, incidentData, selectedIncident]);
 
@@ -125,7 +174,7 @@ const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
   };
 
   const totalFrames = incidentData?.meta?.frames_total || 0;
-  const isReady = !!selectedIncident;
+  const isReady = !!selectedIncident && !!incidentData;
 
   return (
     <section className="playback-panel card">
@@ -175,20 +224,27 @@ const PlaybackViewer = ({ selectedIncident, isPlaying, setIsPlaying }) => {
   );
 };
 
-const DetailsPanel = ({ selectedIncident }) => {
-  const [incidentData, setIncidentData] = useState(null);
+// ── Diagnostic Insights Panel ─────────────────────────────────────────────
+// Bug #5: confidence → compute from violation data instead of phantom field
+// Bug #8: detail-row → stat-row, detail-label → stat-label, detail-value → stat-value
+// Bug #12: Share incidentData via prop instead of duplicate fetch
+const DetailsPanel = ({ incidentData }) => {
+  // Bug #5: Compute average confidence from detections instead of phantom meta.confidence
+  const computeConfidence = (data) => {
+    if (!data?.violation?.detections) return null;
+    const allConfs = [];
+    Object.values(data.violation.detections).forEach(frameDets => {
+      if (Array.isArray(frameDets)) {
+        frameDets.forEach(det => {
+          if (typeof det.conf === 'number') allConfs.push(det.conf);
+        });
+      }
+    });
+    if (allConfs.length === 0) return null;
+    return allConfs.reduce((a, b) => a + b, 0) / allConfs.length;
+  };
 
-  useEffect(() => {
-    if (!selectedIncident) {
-      setIncidentData(null);
-      return;
-    }
-
-    fetch(`http://localhost:8000/api/incidents/${selectedIncident.id}`)
-      .then(res => res.json())
-      .then(setIncidentData)
-      .catch(console.error);
-  }, [selectedIncident]);
+  const avgConf = incidentData ? computeConfidence(incidentData) : null;
 
   return (
     <section className="details-panel card">
@@ -197,43 +253,50 @@ const DetailsPanel = ({ selectedIncident }) => {
       </div>
       
       <div className="details-content" id="details-content">
-        {!selectedIncident ? (
+        {!incidentData ? (
           <div className="placeholder-text">
             <p>Select an incident to view deep classification, severity metrics, and edge encoding latency.</p>
           </div>
-        ) : !incidentData ? (
-          <div className="placeholder-text"><p>Loading details...</p></div>
         ) : (
           <div>
-            <div className="detail-row">
-              <span className="detail-label">Classification</span>
-              <span className="detail-value">{incidentData.violation?.category || 'Unknown'}</span>
+            <div className="insight-block">
+              <h3>Classification</h3>
+              <div className="insight-val">
+                <i className="fa-solid fa-tag text-blue"></i>
+                {incidentData.violation?.category || 'Unknown'}
+              </div>
             </div>
-            <div className="detail-row">
-              <span className="detail-label">Confidence</span>
-              <span className="detail-value">{(incidentData.meta?.confidence * 100).toFixed(1)}%</span>
+
+            <div className="insight-block">
+              <h3>Detection Metrics</h3>
+              <div className="stat-row">
+                <span className="stat-label">Avg. Confidence</span>
+                <span className="stat-value">{avgConf !== null ? `${(avgConf * 100).toFixed(1)}%` : 'N/A'}</span>
+              </div>
+              <div className="stat-row">
+                <span className="stat-label">Edge Encoding</span>
+                <span className="stat-value">{incidentData.meta?.encode_ms ?? '—'} ms</span>
+              </div>
+              <div className="stat-row">
+                <span className="stat-label">Total Frames</span>
+                <span className="stat-value">{incidentData.meta?.frames_total ?? '—'}</span>
+              </div>
             </div>
-            <div className="detail-row">
-              <span className="detail-label">Edge Encoding Latency</span>
-              <span className="detail-value">{incidentData.meta?.encode_ms} ms</span>
-            </div>
-            <div className="detail-row">
-              <span className="detail-label">Total Duration</span>
-              <span className="detail-value">{incidentData.meta?.frames_total} frames</span>
-            </div>
-            
-            <h3 style={{ marginTop: '1.5rem', marginBottom: '1rem', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '0.5rem', color: '#60a5fa' }}>Detections Summary</h3>
-            <div className="detail-row">
-              <span className="detail-label">Phones Detected</span>
-              <span className="detail-value">{incidentData.violation?.phone_count || 0}</span>
-            </div>
-            <div className="detail-row">
-              <span className="detail-label">Face Missing Frames</span>
-              <span className="detail-value">{incidentData.violation?.face_absent_count || 0}</span>
-            </div>
-            <div className="detail-row">
-              <span className="detail-label">Multi-Face Frames</span>
-              <span className="detail-value">{incidentData.violation?.face_multi_count || 0}</span>
+
+            <div className="insight-block">
+              <h3>Detections Summary</h3>
+              <div className="stat-row">
+                <span className="stat-label"><i className="fa-solid fa-mobile-screen text-red"></i> Phones Detected</span>
+                <span className="stat-value">{incidentData.violation?.phone_count || 0}</span>
+              </div>
+              <div className="stat-row">
+                <span className="stat-label"><i className="fa-solid fa-user-slash text-orange"></i> Face Missing</span>
+                <span className="stat-value">{incidentData.violation?.face_absent_count || 0}</span>
+              </div>
+              <div className="stat-row">
+                <span className="stat-label"><i className="fa-solid fa-users text-orange"></i> Multi-Face</span>
+                <span className="stat-value">{incidentData.violation?.face_multi_count || 0}</span>
+              </div>
             </div>
           </div>
         )}
@@ -242,21 +305,25 @@ const DetailsPanel = ({ selectedIncident }) => {
   );
 };
 
+// ── Main App ──────────────────────────────────────────────────────────────
 function App() {
   const [incidents, setIncidents] = useState([]);
   const [metrics, setMetrics] = useState({});
   const [selectedIncident, setSelectedIncident] = useState(null);
+  const [selectedIncidentData, setSelectedIncidentData] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [videoSource, setVideoSource] = useState('webcam');
+  const [sseConnected, setSseConnected] = useState(false);
 
+  // SSE connection with onerror handler (Bug #13)
   useEffect(() => {
-    // Connect to Server-Sent Events
     const eventSource = new EventSource('http://localhost:8000/api/incidents/stream');
     
     eventSource.addEventListener('incidents_update', (e) => {
       try {
         const data = JSON.parse(e.data);
         setIncidents(data);
+        setSseConnected(true);
       } catch (err) {
         console.error("Failed to parse incidents update", err);
       }
@@ -266,33 +333,77 @@ function App() {
       try {
         const data = JSON.parse(e.data);
         setMetrics(data);
+        setSseConnected(true);
       } catch (err) {
         console.error("Failed to parse metrics update", err);
       }
     });
+
+    // Bug #13: Handle SSE errors
+    eventSource.onerror = () => {
+      setSseConnected(false);
+    };
 
     return () => {
       eventSource.close();
     };
   }, []);
 
+  // Bug #12: Single fetch for incident data, shared between PlaybackViewer + DetailsPanel
+  useEffect(() => {
+    if (!selectedIncident) {
+      setSelectedIncidentData(null);
+      return;
+    }
+
+    fetch(`http://localhost:8000/api/incidents/${selectedIncident.id}`)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(data => {
+        setSelectedIncidentData(data);
+      })
+      .catch(err => {
+        console.error("Failed to fetch incident details", err);
+        setSelectedIncidentData(null);
+      });
+  }, [selectedIncident]);
+
   const handleSourceChange = async (e) => {
     const src = e.target.value;
+    const previousSource = videoSource;
     setVideoSource(src);
     try {
-      await fetch('http://localhost:8000/api/set-source', {
+      const resp = await fetch('http://localhost:8000/api/set-source', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source: src })
       });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       setSelectedIncident(null);
+      setSelectedIncidentData(null);
       setIncidents([]);
     } catch (err) {
       console.error("Failed to set source", err);
+      // Rollback on failure (Bug #9 from TC-1.9)
+      setVideoSource(previousSource);
     }
   };
 
-  const isOnline = metrics && metrics.ticks !== undefined;
+  // Bug #10: Wire refresh button
+  const handleRefresh = async () => {
+    try {
+      const resp = await fetch('http://localhost:8000/api/incidents');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      setIncidents(data);
+    } catch (err) {
+      console.error("Failed to refresh incidents", err);
+    }
+  };
+
+  const isOnline = sseConnected && metrics && metrics.ticks !== undefined;
 
   return (
     <>
@@ -305,7 +416,7 @@ function App() {
           <span className="logo-icon"><i className="fa-solid fa-shield-halved"></i></span>
           <div className="logo-text">
             <h1>RVO AI Proctoring Node</h1>
-            <p>Realtime Video Orchestration & Edge YOLOv8/Haar-Cascades</p>
+            <p>Realtime Video Orchestration &amp; Edge YOLOv8</p>
           </div>
         </div>
         
@@ -330,8 +441,8 @@ function App() {
                 <label htmlFor="camera-source"><i className="fa-solid fa-video"></i> Input Source:</label>
                 <select id="camera-source" className="styled-select" value={videoSource} onChange={handleSourceChange}>
                   <option value="webcam">Live Webcam</option>
-                  <option value="hideandpeep.mp4">Sample: Hide & Peep</option>
-                  <option value="phoneandclear.mp4">Sample: Phone & Clear</option>
+                  <option value="hideandpeep.mp4">Sample: Hide &amp; Peep</option>
+                  <option value="phoneandclear.mp4">Sample: Phone &amp; Clear</option>
                 </select>
               </div>
               <div className="live-pulse">REAL-TIME</div>
@@ -339,24 +450,24 @@ function App() {
           </div>
           <div className="metrics-grid">
             <div className="metric-item">
-              <span className="metric-value" id="metric-ticks">{metrics.ticks || '-'}</span>
+              <span className="metric-value" id="metric-ticks">{metrics.ticks ?? '-'}</span>
               <span className="metric-title"><i className="fa-solid fa-clock"></i> Scheduler Ticks</span>
             </div>
             <div className="metric-item">
-              <span className="metric-value" id="metric-events">{metrics.events_emitted || '-'}</span>
+              <span className="metric-value" id="metric-events">{metrics.events_emitted ?? '-'}</span>
               <span className="metric-title"><i className="fa-solid fa-circle-exclamation text-red"></i> Events Emitted</span>
             </div>
             <div className="metric-item">
-              <span className="metric-value" id="metric-frame-drops">{metrics.frame_drops || '-'}</span>
+              <span className="metric-value" id="metric-frame-drops">{metrics.frame_drops ?? '-'}</span>
               <span className="metric-title"><i className="fa-solid fa-triangle-exclamation text-orange"></i> Frame Drops</span>
             </div>
             <div className="metric-item">
-              <span className="metric-value" id="metric-clip-drops">{metrics.clip_drops || '-'}</span>
+              <span className="metric-value" id="metric-clip-drops">{metrics.clip_drops ?? '-'}</span>
               <span className="metric-title"><i className="fa-solid fa-folder-minus text-orange"></i> Clip Drops</span>
             </div>
             <div className="metric-item">
-              <span className="metric-value" id="metric-skips">{metrics.detector_execs || '-'}</span>
-              <span className="metric-title"><i className="fa-solid fa-forward-step"></i> Detector Skips</span>
+              <span className="metric-value" id="metric-skips">{metrics.detector_execs ?? '-'}</span>
+              <span className="metric-title"><i className="fa-solid fa-forward-step"></i> Detector Execs</span>
             </div>
           </div>
         </section>
@@ -364,7 +475,7 @@ function App() {
         <section className="incidents-panel card">
           <div className="section-header">
             <h2><i className="fa-solid fa-list-check"></i> Flagged Infractions Feed</h2>
-            <button id="btn-refresh" className="btn-icon" title="Refresh List"><i className="fa-solid fa-rotate"></i></button>
+            <button id="btn-refresh" className="btn-icon" title="Refresh List" onClick={handleRefresh}><i className="fa-solid fa-rotate"></i></button>
           </div>
           
           <div className="incidents-list-container">
@@ -378,13 +489,18 @@ function App() {
           </div>
         </section>
 
-        <PlaybackViewer 
-          selectedIncident={selectedIncident} 
-          isPlaying={isPlaying} 
-          setIsPlaying={setIsPlaying} 
-        />
+        <ErrorBoundary>
+          <PlaybackViewer 
+            selectedIncident={selectedIncident} 
+            isPlaying={isPlaying} 
+            setIsPlaying={setIsPlaying}
+            incidentData={selectedIncidentData}
+          />
+        </ErrorBoundary>
 
-        <DetailsPanel selectedIncident={selectedIncident} />
+        <ErrorBoundary>
+          <DetailsPanel incidentData={selectedIncidentData} />
+        </ErrorBoundary>
       </main>
 
       <footer className="app-footer">

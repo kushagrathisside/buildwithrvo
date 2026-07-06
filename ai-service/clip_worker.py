@@ -158,7 +158,11 @@ class ClipHandler(FileSystemEventHandler):
             clip_path = os.path.dirname(event.src_path)
             # Add a tiny delay to ensure disk buffers are flushed
             time.sleep(0.5)
-            analyze_clip(clip_path)
+            try:
+                analyze_clip(clip_path)
+            except Exception as e:
+                # Bug #15: Catch all exceptions to prevent watchdog thread death
+                print(f"[Worker] ERROR analyzing clip {clip_path}: {e}", flush=True)
 
 def process_existing_clips():
     """Scan the directory on startup and process anything missing from DB."""
