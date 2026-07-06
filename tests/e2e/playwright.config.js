@@ -24,6 +24,7 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       stdout: 'ignore',
       stderr: 'pipe',
+      cwd: '../../',
     },
     {
       command: 'PYTHONPATH=$(pwd)/poc-dashboard ./venv/bin/python poc-dashboard/server.py',
@@ -31,6 +32,7 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       stdout: 'ignore',
       stderr: 'pipe',
+      cwd: '../../',
     }
   ]
 });
