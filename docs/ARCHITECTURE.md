@@ -1,85 +1,123 @@
-# POC Architecture & Signal Flow (V2)
+# System Architecture and Signal Flow
 
-This document details the end-to-end data flow and signal mapping logic implemented in the proctoring POC V2.
+This document outlines the internal data flow, state management, and signal mapping logic implemented within the RVO Proctoring Framework. The system is designed to provide ultra-low latency, deterministic execution while handling heavy, non-deterministic computer vision workloads.
 
 ---
 
-## 🔄 End-to-End Data Flow
+## 1. Topological Data Flow
+
+The framework orchestrates data across multiple process boundaries using gRPC for inference, SQLite for persistence, and Server-Sent Events (SSE) for frontend reactivity. The following diagram illustrates the complete lifecycle of a video frame from ingestion to UI rendering:
 
 ```text
 +---------------------------------------------------------------------------------------+
 |                                    RVO Core Engine                                    |
-|  - Ingests frames from webcam or MP4 samples into a circular buffer.                  |
-|  - Sequential 1 ms scheduler tick checks FPS limits and signal dependencies.          |
+|  - Ingestion: Captures frames via V4L2 (webcam) or decodes HTTP/MP4 streams.          |
+|  - Circular Buffer: Maintains a high-performance ring buffer holding the last N frames|
+|    in memory to allow retrospective slicing when an event is triggered.               |
+|  - Scheduler: Ticks at exactly 1 ms, evaluating internal FPS limits, managing locks,  |
+|    and resolving signal dependencies without blocking.                                |
 +---------------------------------------------------------------------------------------+
                                            |
-                                           | (Async gRPC mailbox fan-out / 15 FPS)
+                                           | (Asynchronous Memory-Mapped Mailbox)
                                            v
 +---------------------------------------------------------------------------------------+
-|                                gRPC AI Service (:50051)                               |
-|  - Decode JPEG bytes -> Runs YOLOv8 and Haar Cascades.                                |
-|  - Returns lists of SignalOut values (PersonDetected and FacePresent).                |
+|                         AI Inference Server (gRPC :50051)                             |
+|  - Transport: Receives compressed JPEG byte payloads over a gRPC stream.              |
+|  - Inference: Executes YOLOv8 (Ultralytics) for object detection and Haar Cascades    |
+|    for facial boundary analysis.                                                      |
+|  - LRU Caching: Implements a Least Recently Used (LRU) cache keyed by `frame_id`. If  |
+|    multiple RVO policies query the same frame, the tensor operations are bypassed.    |
+|  - Output: Yields a standardized `SignalOut` state (e.g., PersonDetected: 1).         |
 +---------------------------------------------------------------------------------------+
                                            |
-                                           | (gRPC Response)
+                                           | (State Propagation)
                                            v
 +---------------------------------------------------------------------------------------+
-|                               RVO Event & Clip Manager                                |
-|  - Event Engine checks rules: sustained signal for 1000 ms triggers an infraction.    |
-|  - Clip Manager locks buffer, slices the window, writes frames + meta.json to disk.   |
+|                            RVO Event & Clip Manager                                   |
+|  - Aggregation: Monitors incoming gRPC signal streams across all detectors.           |
+|  - Temporal Smoothing: Applies a low-pass filter (e.g., signal must remain high for   |
+|    1000 ms consecutively) to eliminate false positives like camera glitches.          |
+|  - Clip Generation: Upon meeting the temporal threshold, locks the circular buffer,   |
+|    extracts the relevant window of frames, and flushes them to disk with a metadata   |
+|    manifest (I/O operation).                                                          |
 +---------------------------------------------------------------------------------------+
                                            |
-                                           | (Filesystem drop into clips/demo/)
+                                           | (Inotify / Filesystem Event)
                                            v
 +---------------------------------------------------------------------------------------+
-|                           Async Clip Worker (clip_worker.py)                          |
-|  - Watchdog daemon detects new clips instantly.                                       |
-|  - Runs comprehensive YOLOv8 AI verification across all frames in the clip.           |
-|  - Inserts finalized JSON metadata and telemetry into SQLite Database.                |
+|                            Async Daemon (clip_worker.py)                              |
+|  - Watchdog: A daemon running `watchdog.observers` that detects new clip directories. |
+|  - Deep Analysis: Traverses the flushed clip frames, running high-confidence batch    |
+|    verification to ensure the initial real-time trigger was accurate.                 |
+|  - Normalization: Transforms raw tensor outputs into a structured JSON schema.        |
+|  - Persistence: Inserts the normalized incident into a relational SQLite Database.    |
 +---------------------------------------------------------------------------------------+
                                            |
-                                           | (SQLite INSERT)
+                                           | (Relational Persistence)
                                            v
 +---------------------------------------------------------------------------------------+
-|                            FastAPI Backend Server (:8000)                             |
-|  - Streams new SQLite incidents down to the frontend via Server-Sent Events (SSE).    |
-|  - Proxies Prometheus telemetry metrics from RVO Engine to the frontend.              |
+|                             FastAPI Gateway (:8000)                                   |
+|  - Polling Engine: Asynchronously polls the SQLite database for unread incident rows. |
+|  - SSE Tunnel: Establishes a uni-directional Server-Sent Events (SSE) tunnel to push  |
+|    new incidents directly to connected clients, eliminating HTTP polling overhead.    |
+|  - Telemetry: Proxies Prometheus metrics emitted by the RVO Engine to the frontend.   |
 +---------------------------------------------------------------------------------------+
                                            |
-                                           | (HTTP / SSE / REST APIs)
+                                           | (HTTP / SSE Push)
                                            v
 +---------------------------------------------------------------------------------------+
-|                                React Frontend (:5173)                                 |
-|  - Receives SSE updates and renders Glassmorphic UI components instantly.             |
-|  - HTML5 Canvas displays frames with color-coded warning bounding box overlays,       |
-|    properly scaled to match aspect ratios.                                            |
+|                             React Web Client (:5173)                                  |
+|  - State Hydration: Consumes the SSE stream and updates the React state tree.         |
+|  - Canvas Rendering: Translates normalized bounding box coordinates into dynamically    |
+|    scaled HTML5 Canvas vector shapes, calculating the aspect ratio difference between |
+|    the source video resolution and the responsive CSS viewport dimensions.            |
 +---------------------------------------------------------------------------------------+
 ```
 
 ---
 
-## 📡 Signal Mapping Strategy
+## 2. Signal Ontology and Normalization
 
-RVO exposes a fixed enum of signal slots (`Dummy`, `MotionLevel`, `FacePresent`, `PersonDetected`). To model exam proctoring infractions, we map our AI detections to these types:
+The core RVO Engine operates on a generalized, abstract enumeration of event primitives: `Dummy`, `MotionLevel`, `FacePresent`, and `PersonDetected`. The engine has no concept of "Exam Proctoring"; it merely routes signals.
 
-| Infraction Case | AI Detection Criteria | RVO Signal mapped | Signal Value | Event Duration |
+To specialize this engine for proctoring, a translation layer in the gRPC service maps highly specific computer vision outputs into these generalized constraints.
+
+### 2.1 Mapping Table
+
+| Proctoring Infraction Class | Computer Vision Mechanism | Target RVO Primitive | Emitted State | Temporal Persistence Threshold |
 |---|---|---|---|---|
-| **Mobile Phone Present** | YOLOv8 detects a phone (`COCO class 67`) | `PersonDetected` | `1` (infraction) | 1,000 ms |
-| **No Phone Present** | YOLOv8 detects no phone | `PersonDetected` | `0` (normal) | - |
-| **Face Anomaly (0 / >1)** | Haar Cascades face count $\neq 1$ | `FacePresent` | `1` (infraction) | 1,000 ms |
-| **Normal Student Presence**| Haar Cascades face count $= 1$ | `FacePresent` | `0` (normal) | - |
+| **Mobile Device Violation** | YOLOv8 detects bounding box (`COCO class 67: cell phone`) | `PersonDetected` | `1` (Active) | 1,000 ms |
+| **Normal Behavior (No Phone)** | YOLOv8 detects no target classes | `PersonDetected` | `0` (Idle) | - |
+| **Face Anomaly (Absent)** | Haar Cascade detects 0 faces | `FacePresent` | `1` (Active) | 1,000 ms |
+| **Face Anomaly (Multi)** | Haar Cascade detects >1 faces | `FacePresent` | `1` (Active) | 1,000 ms |
+| **Normal Behavior (Single Face)** | Haar Cascade detects exactly 1 face | `FacePresent` | `0` (Idle) | - |
 
-### Trigger Rule
-In [rvo-remote.yaml](../rvo-deployment/config/rvo-remote.yaml), both signals are configured to trigger a `DummyEvent` once the infraction value remains $\ge 1$ continuously for **1,000 milliseconds**. 
+### 2.2 Temporal Constraints and Low-Pass Filtering
+Computer vision is inherently noisy. A student shifting in their chair or briefly looking down can cause the Haar Cascade to drop a frame. If the engine reacted instantly, it would flood the database with micro-events.
+
+To mitigate this, signals are passed through a temporal low-pass filter defined in the `rvo-remote.yaml` configuration matrix. An infraction event is only serialized to disk if the active state (`1`) is sustained continuously without returning to (`0`) for a minimum of **1,000 milliseconds**.
 
 ---
 
-## ⚡ The Decoupled Inference Pattern
+## 3. The Decoupled Caching Paradigm
 
-Model inference is slow (e.g. YOLOv8 on CPU can take 150-250ms per frame). If RVO ran inference directly in the scheduler tick, the tick loop would stall.
+Directly embedding deep learning inference (which can take 100ms - 300ms per frame on CPU) within the hot-path of a frame ingestion loop guarantees systemic instability. If the engine blocks to wait for inference, the camera buffer overflows, leading to dropped frames and severe latency.
 
-To prevent this:
-1. The scheduler tick's `execute()` writes the latest camera frame to a **single-slot mailbox** and returns the latest cached gRPC results instantly.
-2. An independent worker thread retrieves the frame from the mailbox, encodes it, calls the gRPC `Detect()` method, and updates the cache.
-3. If gRPC fails or times out, the cache expires via TTL, and the rest of the RVO scheduler continues to tick at 1 ms without head-of-line (HOL) blocking.
-4. Heavy analysis is further offloaded to the asynchronous `clip_worker.py` daemon, removing blocking operations from the HTTP API server.
+To resolve this, the RVO Framework implements an **Asynchronous Isolation Pattern**:
+
+### 3.1 Non-Blocking Execution
+1. **The Scheduler Tick:** The RVO scheduler runs every 1 millisecond. When a frame is captured, it is placed in the circular buffer. The engine instantly requests the current state of all AI detectors.
+2. **The Mailbox Protocol:** Instead of waiting for the AI to process the current frame, the engine writes the frame to a single-slot asynchronous mailbox and immediately reads the *last known inference state* from its local cache. The tick completes in under 1ms.
+3. **Dedicated Workers:** An independent background thread within RVO continuously drains the memory slot, JPEG-compresses the frame, and invokes the `Detect()` gRPC stub over the network.
+4. **Cache Updates:** When the gRPC response eventually returns (e.g., 200ms later), the background thread updates the local cache. The next 1ms scheduler tick will instantly read this updated state.
+
+### 3.2 Memoization and Deduplication
+In the `app_service.py` gRPC server, multiple logical detectors (e.g., one for phones, one for faces) might query the server simultaneously for the exact same frame. 
+
+To prevent running YOLOv8 multiple times on the same data, the gRPC service implements memoization using the unique `frame_id`:
+* A `_inference_cache` dictionary stores the output of the tensor graph keyed by `frame_id`.
+* The dictionary is guarded by a `threading.Lock()` to ensure thread safety across concurrent gRPC requests.
+* A short Time-To-Live (TTL) automatically evicts stale frames to prevent memory leaks.
+
+### 3.3 Graceful Degradation
+If the gRPC link is severed, or if the host machine experiences a massive CPU spike causing inference to time out, the local cache naturally expires via TTL. The RVO scheduler continues to tick at 1 ms, seamlessly dropping inference capabilities without halting hardware camera ingestion. Once the AI service recovers, the system automatically self-heals and resumes tracking.

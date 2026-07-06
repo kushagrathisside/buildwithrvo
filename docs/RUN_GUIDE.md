@@ -1,96 +1,99 @@
-# Proctoring POC Execution & Run Guide (V2)
+# Deployment and Execution Guide
 
-Follow this guide to start, run, test, and customize the online exam proctoring POC V2.
+This document provides standardized procedures for deploying, validating, and debugging the RVO Proctoring Framework. 
 
----
+## Automated Execution (Recommended)
 
-## 🚀 Unified Execution (Recommended)
+For rapid evaluation and localized testing, the repository provides a unified orchestration script. This script automatically handles dependency resolution, virtual environment provisioning, and daemon lifecycle management.
 
-First, clone the repository:
-```bash
-git clone https://github.com/kushagrathisside/buildwithrvo
-cd buildwithrvo
-```
+Execute the following command from the repository root:
 
-You can launch all components of the POC (the FastAPI server, the gRPC AI service, the React Frontend, and the RVO engine) in a single command using our unified launcher script. 
-
-Run the following command from the root of the `buildwithrvo` directory:
 ```bash
 ./run_poc.sh
 ```
 
-This script will start the background services, wait for them to initialize, install dependencies, display connection health details, boot up the RVO engine, and **automatically clean up all processes when you press `CTRL+C`**.
+**Boot Sequence:**
+1. The script provisions a Python `venv` and installs dependencies defined in `requirements.txt`.
+2. NPM dependencies are installed for the React client.
+3. The AI Inference Server (`app_service.py`) and Background Daemon (`clip_worker.py`) are spawned as background jobs.
+4. The FastAPI Gateway (`server.py`) and Vite Dev Server are initialized.
+5. The Rust RVO Engine is compiled (if necessary) and executed.
+6. The script intercepts `SIGINT` (CTRL+C) to guarantee graceful termination of all child processes.
+
+Upon successful execution, the interface is accessible at: **[http://localhost:5173](http://localhost:5173)**
 
 ---
 
-## 🧪 Running Automated Tests
+## Testing Pipeline
 
-V2 includes a comprehensive test suite to validate backend API logic and frontend UI workflows.
+The framework is bundled with a deterministic Continuous Integration (CI) test suite that validates the integration between the backend data stores and the React rendering layer.
 
-To execute the full test suite (Pytest + Playwright E2E), run:
+To execute the full test suite locally:
+
 ```bash
 ./run_tests.sh
 ```
-This automatically boots a test database, starts isolated FastAPI test servers, runs backend integration tests, executes Playwright E2E interactions on the Chromium browser, and generates an HTML test report.
+
+**Test Coverage:**
+* **Pytest (Backend):** Validates REST endpoints, SQLite concurrency, and edge cases in the `clip_worker` inference logic.
+* **Playwright (Frontend E2E):** Boots headless Chromium instances to simulate user interactions, verifying that Server-Sent Events successfully hydrate the DOM and trigger Canvas rerenders.
 
 ---
 
-## 🛠️ Manual Execution (For Debugging)
+## Manual Execution (Debugging Mode)
 
-If you prefer to inspect output logs for each service separately, open multiple terminal tabs and run:
+For granular debugging and log inspection, it is often necessary to run the microservices in isolated terminal sessions. Ensure that the Python virtual environment is activated (`source venv/bin/activate`) before proceeding.
 
-### Terminal 1: Start the Dashboard Backend API & Streamer
+### 1. Initialize the FastAPI Gateway
 ```bash
-./venv/bin/python poc-dashboard/server.py
+python poc-dashboard/server.py
 ```
+*Expected Output:* Uvicorn running on port 8000.
 
-### Terminal 2: Start the gRPC AI Service
+### 2. Initialize the AI Inference Server
 ```bash
-./venv/bin/python ai-service/app_service.py
+python ai-service/app_service.py
 ```
+*Expected Output:* gRPC Server listening on port 50051.
 
-### Terminal 3: Start the Async Clip Worker
+### 3. Initialize the Clip Worker Daemon
 ```bash
-./venv/bin/python ai-service/clip_worker.py
+python ai-service/clip_worker.py
 ```
+*Expected Output:* Watchdog observing the `/rvo-deployment/clips/demo` directory.
 
-### Terminal 4: Start the React Frontend
+### 4. Initialize the React Client
 ```bash
 cd poc-dashboard-v2
 npm run dev
 ```
+*Expected Output:* Vite server listening on port 5173.
 
-### Terminal 5: Run the RVO Core Engine
+### 5. Initialize the RVO Engine
 ```bash
 cd rvo-deployment
 ./rvo-bin --config config/rvo-remote.yaml
 ```
+*Expected Output:* RVO Core binding to camera index / HTTP stream.
 
 ---
 
-## 📺 Reviewing Results
+## Hardware Configuration (Webcam Integration)
 
-Once all modules are running:
-1. Open your browser and navigate to **`http://localhost:5173`** (if using the unified script or `npm run dev`).
-2. Check the **Health Badges** in the top right to verify both the RVO Engine and the AI gRPC Service are online.
-3. Observe **Live Metrics** updating as the scheduler ticks.
-4. Use the **Source Dropdown** to instantly switch the video source from the live webcam to simulated MP4 feeds.
-5. As the engine runs, if an infraction occurs, the async AI worker generates a detailed violation report. The FastAPI server streams this data via **Server-Sent Events (SSE)**, creating a new incident card instantly.
-6. Select any incident card from the feed and click **Play** to review the frame playback with bounding boxes scaled and drawn dynamically over the canvas.
+By default, the framework is configured to ingest a synthetic MP4 stream to allow headless execution on CI runners. To transition the framework to monitor physical hardware (e.g., a local USB Webcam):
 
----
+1. Open the primary configuration manifest: `rvo-deployment/config/rvo-remote.yaml`.
+2. Locate the `camera` block and replace the `source_uri` with a `device_index`:
 
-## 📷 Switching to a Physical Webcam
-
-The POC is configured by default to read a physical camera stream or a simulated MP4 via the frontend dropdown. 
-
-If you want to manually hardcode the engine to use a physical device:
-
-1. Open `rvo-deployment/config/rvo-remote.yaml`.
-2. Replace the `camera` config block:
+   **Before (Synthetic Stream):**
    ```yaml
-   # Change to local webcam:
+   camera:
+     source_uri: "http://localhost:8000/api/video_feed"
+   ```
+
+   **After (Physical Hardware):**
+   ```yaml
    camera:
      device_index: 0
    ```
-3. RVO will capture frames directly from your physical webcam! You can hold a cell phone in front of the camera or look away to trigger live events and see them render in real-time on your dashboard.
+3. Restart the RVO Engine. The framework will now ingest raw frames from your `/dev/video0` or equivalent OS-level video interface.
